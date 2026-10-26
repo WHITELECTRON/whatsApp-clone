@@ -1,0 +1,163 @@
+package com.anki.whatsapp.presentation.viewmodels
+
+import android.app.Activity
+import android.content.Context
+import android.graphics.Bitmap
+import android.util.Base64
+import android.util.Log
+import androidx.lifecycle.ViewModel
+import com.anki.whatsapp.models.PhoneAuthUser
+import com.google.firebase.FirebaseException
+import com.google.firebase.auth.FirebaseAuth
+import com.google.firebase.auth.PhoneAuthCredential
+import com.google.firebase.auth.PhoneAuthOptions
+import com.google.firebase.auth.PhoneAuthProvider
+import com.google.firebase.database.FirebaseDatabase
+import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import java.io.ByteArrayOutputStream
+import java.util.concurrent.TimeUnit
+import javax.inject.Inject
+
+sealed class AuthState {
+    data object Idle : AuthState()
+    data object Loading : AuthState()
+    data class CodeSent(val verificationId: String) : AuthState()
+    data class Success(val user: PhoneAuthUser) : AuthState()
+    data class Error(val message: String) : AuthState()
+}
+
+@HiltViewModel
+class PhoneAuthViewModel @Inject constructor(
+    private val auth: FirebaseAuth,
+    private val database: FirebaseDatabase
+) : ViewModel() {
+
+    private val _authState = MutableStateFlow<AuthState>(AuthState.Idle)
+    val authState = _authState.asStateFlow()
+
+    private val userRef = database.reference.child("users")
+
+    fun sendVerificationCode(phoneNumber: String, activity: Activity) {
+        _authState.value = AuthState.Loading
+
+        val callbacks = object : PhoneAuthProvider.OnVerificationStateChangedCallbacks() {
+            override fun onCodeSent(
+                verificationId: String,
+                token: PhoneAuthProvider.ForceResendingToken
+            ) {
+                super.onCodeSent(verificationId, token)
+                Log.d("PhoneAuth", "onCodeSent triggered, verificationId: $verificationId")
+                _authState.value = AuthState.CodeSent(verificationId)
+            }
+
+            override fun onVerificationCompleted(credential: PhoneAuthCredential) {
+                signInWithCredential(credential, activity)
+            }
+
+            override fun onVerificationFailed(exception: FirebaseException) {
+                Log.e("PhoneAuth", "verification failed: ${exception.message}")
+                _authState.value = AuthState.Error(exception.message ?: "Verification failed")
+            }
+        }
+
+        val phoneAuthOptions = PhoneAuthOptions.newBuilder(auth)
+            .setPhoneNumber(phoneNumber)
+            .setTimeout(60L, TimeUnit.SECONDS)
+            .setActivity(activity)
+            .setCallbacks(callbacks)
+            .build()
+
+        PhoneAuthProvider.verifyPhoneNumber(phoneAuthOptions)
+    }
+
+    private fun signInWithCredential(credential: PhoneAuthCredential, context: Context) {
+        _authState.value = AuthState.Loading
+
+        auth.signInWithCredential(credential).addOnCompleteListener { task ->
+            if (task.isSuccessful) {
+                val user = auth.currentUser
+                val phoneAuthUser = PhoneAuthUser(
+                    userId = user?.uid ?: "",
+                    phoneNumber = user?.phoneNumber ?: ""
+                )
+
+                markUserAsSignedIn(context)
+                _authState.value = AuthState.Success(phoneAuthUser)
+                fetchUserProfile(user?.uid ?: "")
+            } else {
+                _authState.value = AuthState.Error(task.exception?.message ?: "Sign in failed")
+            }
+        }
+    }
+
+    private fun markUserAsSignedIn(context: Context) {
+        val sharedPreferences = context.getSharedPreferences("app_prefs", Context.MODE_PRIVATE)
+        sharedPreferences.edit().putBoolean("is_signed_in", true).apply()
+    }
+
+    private fun fetchUserProfile(userId: String) {
+        val specificUserRef = userRef.child(userId)
+        specificUserRef.get().addOnSuccessListener { snapshot ->
+            if (snapshot.exists()) {
+                val userProfile = snapshot.getValue(PhoneAuthUser::class.java)
+                if (userProfile != null) {
+                    _authState.value = AuthState.Success(userProfile)
+                }
+            }
+        }.addOnFailureListener {
+            _authState.value = AuthState.Error("Failed to fetch user profile")
+        }
+    }
+
+    fun verifyCode(otp: String, context: Context) {
+        val currentAuthState = _authState.value
+
+        if (currentAuthState !is AuthState.CodeSent || currentAuthState.verificationId.isEmpty()) {
+            Log.e("PhoneAuth", "Attempting to verify OTP without valid verification ID")
+            _authState.value = AuthState.Error("Verification not started or invalid ID")
+            return
+        }
+
+        val credential = PhoneAuthProvider.getCredential(currentAuthState.verificationId, otp)
+        signInWithCredential(credential, context)
+    }
+
+    fun saveUserProfile(
+        userId: String,
+        name: String,
+        status: String,
+        profileImage: Bitmap?
+    ) {
+        val encodedImage = profileImage?.let { convertBitmapToBase64(it) }
+
+        val userProfile = PhoneAuthUser(
+            userId = userId,
+            name = name,
+            status = status,
+            phoneNumber = auth.currentUser?.phoneNumber ?: "",
+            profileImage = encodedImage
+        )
+
+        val database = FirebaseDatabase.getInstance().reference
+        database.child("users").child(userId).setValue(userProfile)
+    }
+
+    private fun convertBitmapToBase64(bitmap: Bitmap): String {
+        val byteArrayOutputStream = ByteArrayOutputStream()
+        bitmap.compress(Bitmap.CompressFormat.JPEG, 100, byteArrayOutputStream)
+        val byteArray = byteArrayOutputStream.toByteArray()
+        return Base64.encodeToString(byteArray, Base64.DEFAULT)
+    }
+
+    fun resetAuthState() {
+        _authState.value = AuthState.Idle
+    }
+
+    fun signOut(activity: Activity) {
+        auth.signOut()
+        val sharedPreferences = activity.getSharedPreferences("app_prefs", Context.MODE_PRIVATE)
+        sharedPreferences.edit().putBoolean("is_signed_in", false).apply()
+    }
+}
